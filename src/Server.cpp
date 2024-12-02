@@ -7,8 +7,28 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <thread>
+#include <vector>
 
 const int BUFFER_SIZE = 1024;
+
+void handle_client(int client_fd) {
+    while (true) {
+        char buffer[BUFFER_SIZE] = {0};
+        ssize_t bytes_read = recv(client_fd, buffer, BUFFER_SIZE - 1, 0);
+        
+        if (bytes_read <= 0) {
+            std::cout << "Client disconnected\n";
+            break;
+        }
+
+        if (strstr(buffer, "PING") != nullptr) {
+            const char* response = "+PONG\r\n";
+            send(client_fd, response, strlen(response), 0);
+        }
+    }
+    close(client_fd);
+}
 
 int main(int argc, char **argv) {
     // Flush after every std::cout / std::cerr
@@ -45,7 +65,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    std::cout << "Waiting for a client to connect...\n";
+    std::cout << "Waiting for clients to connect...\n";
+
+    // Vector to store client threads
+    std::vector<std::thread> client_threads;
 
     while (true) {
         struct sockaddr_in client_addr;
@@ -58,29 +81,20 @@ int main(int argc, char **argv) {
         }
 
         std::cout << "Client connected\n";
-
-        // Handle multiple commands from the same client
-        while (true) {
-            char buffer[BUFFER_SIZE] = {0};
-            ssize_t bytes_read = recv(client_fd, buffer, BUFFER_SIZE - 1, 0);
-            
-            if (bytes_read <= 0) {
-                // Client disconnected or error occurred
-                std::cout << "Client disconnected\n";
-                break;
-            }
-
-            // Simple PING command handling
-            // In a real Redis server, you would parse the RESP protocol here
-            if (strstr(buffer, "PING") != nullptr) {
-                const char* response = "+PONG\r\n";
-                send(client_fd, response, strlen(response), 0);
-            }
-        }
-
-        close(client_fd);
+        
+        // Create a new thread for each client
+        client_threads.emplace_back(handle_client, client_fd);
+        // Detach the thread to allow it to operate independently
+        client_threads.back().detach();
     }
 
+    // Cleanup
+    for (auto& thread : client_threads) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+    
     close(server_fd);
     return 0;
 }
