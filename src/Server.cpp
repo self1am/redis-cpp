@@ -12,11 +12,32 @@
 #include <unordered_map>
 #include <mutex>
 #include <sstream>
+#include <chrono>
 
 const int BUFFER_SIZE = 1024;
 
+// Structure to hold value and expiry time
+struct ValueWithExpiry {
+    std::string value;
+    std::chrono::time_point<std::chrono::steady_clock> expiry;
+    bool has_expiry;
+    
+    ValueWithExpiry(const std::string& val) : 
+        value(val), has_expiry(false) {}
+    
+    ValueWithExpiry(const std::string& val, long px_millis) : 
+        value(val), 
+        expiry(std::chrono::steady_clock::now() + std::chrono::milliseconds(px_millis)),
+        has_expiry(true) {}
+        
+    bool is_expired() const {
+        if (!has_expiry) return false;
+        return std::chrono::steady_clock::now() > expiry;
+    }
+};
+
 // Global key-value store with mutex for thread safety
-std::unordered_map<std::string, std::string> kv_store;
+std::unordered_map<std::string, ValueWithExpiry> kv_store;
 std::mutex kv_mutex;
 
 // Parse RESP array and return vector of strings
@@ -44,15 +65,20 @@ std::vector<std::string> parse_resp(const std::string& input) {
     return parts;
 }
 
+// Convert string to uppercase for case-insensitive comparison
+std::string to_upper(const std::string& str) {
+    std::string upper = str;
+    for (char& c : upper) {
+        c = toupper(c);
+    }
+    return upper;
+}
+
 // Handle different commands
 std::string handle_command(const std::vector<std::string>& parts) {
     if (parts.empty()) return "-ERR empty command\r\n";
     
-    std::string command = parts[0];
-    // Convert command to uppercase for case-insensitive comparison
-    for (char& c : command) {
-        c = toupper(c);
-    }
+    std::string command = to_upper(parts[0]);
     
     if (command == "PING") {
         return "+PONG\r\n";
@@ -60,16 +86,31 @@ std::string handle_command(const std::vector<std::string>& parts) {
     else if (command == "ECHO" && parts.size() > 1) {
         return "+" + parts[1] + "\r\n";
     }
-    else if (command == "SET" && parts.size() > 2) {
+    else if (command == "SET" && parts.size() >= 2) {
         std::lock_guard<std::mutex> lock(kv_mutex);
-        kv_store[parts[1]] = parts[2];
+        
+        // Check for PX argument
+        if (parts.size() >= 4 && to_upper(parts[3]) == "PX" && parts.size() >= 5) {
+            try {
+                long px_millis = std::stol(parts[4]);
+                kv_store[parts[1]] = ValueWithExpiry(parts[2], px_millis);
+            } catch (const std::exception& e) {
+                return "-ERR invalid expire time in 'set' command\r\n";
+            }
+        } else {
+            kv_store[parts[1]] = ValueWithExpiry(parts[2]);
+        }
         return "+OK\r\n";
     }
     else if (command == "GET" && parts.size() > 1) {
         std::lock_guard<std::mutex> lock(kv_mutex);
         auto it = kv_store.find(parts[1]);
         if (it != kv_store.end()) {
-            return "+" + it->second + "\r\n";
+            if (!it->second.is_expired()) {
+                return "+" + it->second.value + "\r\n";
+            }
+            // Remove expired key
+            kv_store.erase(it);
         }
         return "$-1\r\n"; // Redis null response
     }
@@ -107,7 +148,7 @@ void handle_client(int client_fd) {
 }
 
 int main(int argc, char **argv) {
-    // Flush after every std::cout / std::cerr
+    // Main function remains unchanged
     std::cout << std::unitbuf;
     std::cerr << std::unitbuf;
 
