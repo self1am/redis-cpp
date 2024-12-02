@@ -9,22 +9,98 @@
 #include <netdb.h>
 #include <thread>
 #include <vector>
+#include <unordered_map>
+#include <mutex>
+#include <sstream>
 
 const int BUFFER_SIZE = 1024;
 
+// Global key-value store with mutex for thread safety
+std::unordered_map<std::string, std::string> kv_store;
+std::mutex kv_mutex;
+
+// Parse RESP array and return vector of strings
+std::vector<std::string> parse_resp(const std::string& input) {
+    std::vector<std::string> parts;
+    std::istringstream iss(input);
+    std::string line;
+    
+    // First line should be array length
+    std::getline(iss, line);
+    if (line[0] != '*') return parts;
+    
+    int array_len = std::stoi(line.substr(1));
+    
+    for (int i = 0; i < array_len; i++) {
+        // Get bulk string length
+        std::getline(iss, line);
+        if (line[0] != '$') continue;
+        
+        // Get actual string
+        std::getline(iss, line);
+        parts.push_back(line);
+    }
+    
+    return parts;
+}
+
+// Handle different commands
+std::string handle_command(const std::vector<std::string>& parts) {
+    if (parts.empty()) return "-ERR empty command\r\n";
+    
+    std::string command = parts[0];
+    // Convert command to uppercase for case-insensitive comparison
+    for (char& c : command) {
+        c = toupper(c);
+    }
+    
+    if (command == "PING") {
+        return "+PONG\r\n";
+    }
+    else if (command == "ECHO" && parts.size() > 1) {
+        return "+" + parts[1] + "\r\n";
+    }
+    else if (command == "SET" && parts.size() > 2) {
+        std::lock_guard<std::mutex> lock(kv_mutex);
+        kv_store[parts[1]] = parts[2];
+        return "+OK\r\n";
+    }
+    else if (command == "GET" && parts.size() > 1) {
+        std::lock_guard<std::mutex> lock(kv_mutex);
+        auto it = kv_store.find(parts[1]);
+        if (it != kv_store.end()) {
+            return "+" + it->second + "\r\n";
+        }
+        return "$-1\r\n"; // Redis null response
+    }
+    
+    return "-ERR unknown command\r\n";
+}
+
 void handle_client(int client_fd) {
+    char buffer[BUFFER_SIZE];
+    std::string incomplete_data;
+    
     while (true) {
-        char buffer[BUFFER_SIZE] = {0};
+        std::memset(buffer, 0, BUFFER_SIZE);
         ssize_t bytes_read = recv(client_fd, buffer, BUFFER_SIZE - 1, 0);
         
         if (bytes_read <= 0) {
             std::cout << "Client disconnected\n";
             break;
         }
-
-        if (strstr(buffer, "PING") != nullptr) {
-            const char* response = "+PONG\r\n";
-            send(client_fd, response, strlen(response), 0);
+        
+        incomplete_data += std::string(buffer, bytes_read);
+        
+        // Process all complete commands in the buffer
+        size_t pos;
+        while ((pos = incomplete_data.find("\r\n")) != std::string::npos) {
+            std::string command = incomplete_data.substr(0, pos + 2);
+            incomplete_data = incomplete_data.substr(pos + 2);
+            
+            std::vector<std::string> parts = parse_resp(command);
+            std::string response = handle_command(parts);
+            send(client_fd, response.c_str(), response.length(), 0);
         }
     }
     close(client_fd);
@@ -41,8 +117,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Since the tester restarts your program quite often, setting SO_REUSEADDR
-    // ensures that we don't run into 'Address already in use' errors
     int reuse = 1;
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
         std::cerr << "setsockopt failed\n";
@@ -67,7 +141,6 @@ int main(int argc, char **argv) {
 
     std::cout << "Waiting for clients to connect...\n";
 
-    // Vector to store client threads
     std::vector<std::thread> client_threads;
 
     while (true) {
@@ -82,19 +155,10 @@ int main(int argc, char **argv) {
 
         std::cout << "Client connected\n";
         
-        // Create a new thread for each client
         client_threads.emplace_back(handle_client, client_fd);
-        // Detach the thread to allow it to operate independently
         client_threads.back().detach();
     }
 
-    // Cleanup
-    for (auto& thread : client_threads) {
-        if (thread.joinable()) {
-            thread.join();
-        }
-    }
-    
     close(server_fd);
     return 0;
 }
